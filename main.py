@@ -7,6 +7,7 @@ import mysql.connector
 from mysql.connector import pooling
 from mysql.connector import errors as sqlerr
 from datetime import datetime, date
+from pydantic import BaseModel
 
 load_dotenv()
 
@@ -49,6 +50,7 @@ class TagRow(BaseModel):
     remark: str | None = None
     updated_at: str | None = None
     updated_by: str | None = None
+    audit_at: str | None = None
 
 class UpdateReq(BaseModel):
     qty: int | None = None
@@ -80,21 +82,26 @@ class RegisterReq(BaseModel):
     actor: str = "userA"
     device_id: str = "T1U-1"
 
-# NEW: Audit req/resp
-class AuditReq(BaseModel):
-    tid: str | None = None
-    epc: str | None = None
-    qty: int | None = None
-    rack_location: str | None = None   # None=不改, ""=清空, 其他=更新
-    remark: str | None = None
-    actor: str = "auditor"
+class DeregReq(BaseModel):
+    actor: str = "userA"
     device_id: str = "T1U-1"
+    remark: str | None = None
 
-class AuditResp(BaseModel):
-    audit_id: int
-    result: str               # "NO_CHANGES" / "CHANGED"
-    change_notes: str | None
-    latest: TagRow | None
+# NEW: Audit req/resp
+# class AuditReq(BaseModel):
+#     tid: str | None = None
+#     epc: str | None = None
+#     qty: int | None = None
+#     rack_location: str | None = None   # None=不改, ""=清空, 其他=更新
+#     remark: str | None = None
+#     actor: str = "auditor"
+#     device_id: str = "T1U-1"
+
+# class AuditResp(BaseModel):
+#     audit_id: int
+#     result: str               # "NO_CHANGES" / "CHANGED"
+#     change_notes: str | None
+#     latest: TagRow | None
 
 # 需要库位的区域（与前端一致）
 REQUIRED_RACK_AREAS = {"W/H", "KITING"}
@@ -140,7 +147,7 @@ async def by_epc(epc: str):
             try:
                 cur.execute("""
                     SELECT tid, epc, label_number, muf_no, item, qty, batch_no, rack_location, area,
-                           remark, updated_at, updated_by
+                           remark, updated_at, updated_by, audit_at
                     FROM rfid_tags_current WHERE UPPER(epc)=UPPER(%s) LIMIT 1
                 """, (epc,))
                 row = cur.fetchone()
@@ -165,7 +172,7 @@ async def by_tid(tid: str):
             try:
                 cur.execute("""
                     SELECT tid, epc, label_number, muf_no, item, qty, batch_no, rack_location, area,
-                           remark, updated_at, updated_by
+                           remark, updated_at, updated_by, audit_at
                     FROM rfid_tags_current WHERE UPPER(tid)=UPPER(%s) LIMIT 1
                 """, (tid,))
                 row = cur.fetchone()
@@ -202,7 +209,7 @@ async def update_by_tid(tid: str, body: UpdateReq):
             try:
                 # 锁行（包含 updated_at）
                 cur.execute("""
-                    SELECT tid, epc, label_number, muf_no, item, qty, batch_no, rack_location, area, updated_at
+                    SELECT tid, epc, label_number, muf_no, item, qty, batch_no, rack_location, area, updated_at, audit_at
                     FROM rfid_tags_current WHERE UPPER(tid)=UPPER(%s) FOR UPDATE
                 """, (tid,))
                 old = cur.fetchone()
@@ -263,7 +270,7 @@ async def update_by_tid(tid: str, body: UpdateReq):
                 # 取新值
                 cur.execute("""
                     SELECT tid, epc, label_number, muf_no, item, qty, batch_no, rack_location, area,
-                           remark, updated_at, updated_by
+                           remark, updated_at, updated_by, audit_at
                     FROM rfid_tags_current WHERE UPPER(tid)=UPPER(%s)
                 """, (tid,))
                 new = cur.fetchone()
@@ -352,7 +359,7 @@ async def register(body: RegisterReq):
 
                 cur.execute("""
                     SELECT tid, epc, label_number, muf_no, item, qty, batch_no, rack_location, area,
-                           remark, updated_at, updated_by
+                           remark, updated_at, updated_by, audit_at
                     FROM rfid_tags_current WHERE UPPER(tid)=UPPER(%s) LIMIT 1
                 """, (tid_up,))
                 row = cur.fetchone()
@@ -449,7 +456,7 @@ async def tags_updated_since(
             try:
                 cur.execute("""
                     SELECT tid, epc, label_number, muf_no, item, qty, batch_no, rack_location, area,
-                           remark, updated_at, updated_by
+                           remark, updated_at, updated_by, audit_at
                     FROM rfid_tags_current
                     WHERE (updated_at > %s)
                        OR (updated_at = %s AND tid > %s)
@@ -465,11 +472,18 @@ async def tags_updated_since(
     rows = await asyncio.wait_for(asyncio.to_thread(_work), timeout=int(os.getenv("READ_TIMEOUT", "4")))
     return rows
 
-# ---------- NEW: AUDIT ----------
-@app.post("/audit/verify-save", dependencies=[Depends(require_key)])
-async def audit_verify_save(body: AuditReq) -> AuditResp:
-    pool = get_pool()
 
+
+
+# ---------- AUDIT REMARK ----------
+class AuditMarkReq(BaseModel):
+    actor: str = "auditor"
+    device_id: str = "T1U-1"
+    remark: str | None = None
+
+@app.post("/tags/{tid}/audit", dependencies=[Depends(require_key)])
+async def mark_audit_by_tid(tid: str, body: AuditMarkReq):
+    pool = get_pool()
     def _work():
         conn = pool.get_connection()
         try:
@@ -477,18 +491,7 @@ async def audit_verify_save(body: AuditReq) -> AuditResp:
             conn.start_transaction()
             cur = conn.cursor(dictionary=True)
             try:
-                # 1) by-epc → tid
-                tid = body.tid
-                if (tid is None or tid.strip() == "") and body.epc:
-                    cur.execute("SELECT tid FROM rfid_tags_current WHERE UPPER(epc)=UPPER(%s) LIMIT 1", (body.epc,))
-                    row = cur.fetchone()
-                    if not row:
-                        raise HTTPException(404, "not found")
-                    tid = row["tid"]
-                if tid is None or tid.strip() == "":
-                    raise HTTPException(400, "tid or epc required")
-
-                # 2) 锁当前行
+                # 1) 锁定当前行
                 cur.execute("""
                     SELECT tid, epc, label_number, muf_no, item, qty, batch_no, rack_location, area
                     FROM rfid_tags_current WHERE UPPER(tid)=UPPER(%s) FOR UPDATE
@@ -497,100 +500,42 @@ async def audit_verify_save(body: AuditReq) -> AuditResp:
                 if not old:
                     raise HTTPException(404, "not found")
 
-                # 3) 目标变更
-                rack_raw = body.rack_location if isinstance(body.rack_location, str) else None
-                rack_up  = (rack_raw.strip().upper() if isinstance(rack_raw, str) and rack_raw.strip() != "" else None)
-                final_qty  = (body.qty if body.qty is not None else old["qty"])
-                final_rack = old["rack_location"] if rack_raw is None else (None if rack_raw == "" else rack_up)
-
-                final_area = old["area"]
-                if final_area in REQUIRED_RACK_AREAS and (final_rack is None or (isinstance(final_rack, str) and final_rack.strip() == "")):
-                    raise HTTPException(400, f"rack_location required for area {final_area}")
-
-                qty_changed  = (body.qty is not None and body.qty != old["qty"])
-                rack_changed = (rack_raw is not None and final_rack != old["rack_location"])
-
-                # 4) UPDATE
+                # 2) 更新 audit_at（并记 updated_by/updated_at 便于追溯）
                 cur.execute("""
                     UPDATE rfid_tags_current
-                    SET qty=%s,
-                        rack_location = CASE
-                            WHEN %s IS NULL THEN rack_location
-                            WHEN %s = '' THEN NULL
-                            ELSE %s
-                        END,
-                        updated_at=NOW(), updated_by=%s
+                    SET audit_at = NOW(),
+                        updated_at = NOW(),
+                        updated_by = %s
                     WHERE UPPER(tid)=UPPER(%s)
-                """, (final_qty, rack_raw, rack_raw, rack_up, body.actor, tid))
+                """, (body.actor, tid))
 
-                # 5) 读取新值
+                # 3) 读新值
                 cur.execute("""
                     SELECT tid, epc, label_number, muf_no, item, qty, batch_no, rack_location, area,
-                           remark, updated_at, updated_by
+                           remark, updated_at, updated_by, audit_at
                     FROM rfid_tags_current WHERE UPPER(tid)=UPPER(%s)
                 """, (tid,))
                 new = _normalize_row(cur.fetchone())
 
-                # 6) 日志
-                action = "ADJUST_QTY" if qty_changed else ("MOVE" if rack_changed else "WRITE_INFO")
+                # 4) 落一条日志（AUDIT）
                 cur.execute("""
                     INSERT INTO rfid_tags_log
                     (tid, epc, label_number, item, batch_no, action,
                      qty_old, qty_new, from_rack_location, to_rack_location,
                      area_old, area_new, remark, updated_at, updated_by)
                     VALUES
-                    (%s,%s,%s,%s,%s,%s,
-                     %s,%s,%s,%s,
+                    (%s,%s,%s,%s,%s,'AUDIT',
+                     %s,%s,NULL,NULL,
                      %s,%s,%s,NOW(),%s)
                 """, (
                     old["tid"], new["epc"], new["label_number"], new["item"], new["batch_no"],
-                    action,
-                    old["qty"], new["qty"],
-                    old["rack_location"], new["rack_location"],
-                    old["area"], new["area"],
+                    old["qty"], old["qty"],     # 审计不改数量 → old=old
+                    old["area"], old["area"],   # 审计不改区域
                     body.remark, body.actor
                 ))
 
-                # 7) 审计
-                result = "CHANGED" if (qty_changed or rack_changed) else "NO_CHANGES"
-                notes_parts = []
-                if qty_changed:
-                    notes_parts.append(f"QTY: {old['qty']} -> {final_qty}")
-                if rack_changed:
-                    notes_parts.append(f"LOCATION: {old['rack_location'] or '-'} -> {final_rack or '-'}")
-                change_notes = "; ".join(notes_parts) if notes_parts else None
-
-                cur.execute("""
-                    SELECT id FROM rfid_audit
-                    WHERE UPPER(tid)=UPPER(%s)
-                      AND qty_old <=> %s AND qty_new <=> %s
-                      AND (from_rack_location <=> %s) AND (to_rack_location <=> %s)
-                      AND (device_id <=> %s) AND (verified_by <=> %s)
-                      AND created_at >= NOW() - INTERVAL 5 SECOND
-                    ORDER BY id DESC LIMIT 1
-                """, (old["tid"], old["qty"], final_qty, old["rack_location"], final_rack, body.device_id, body.actor))
-                dup = cur.fetchone()
-                if dup:
-                    audit_id = dup["id"]
-                else:
-                    cur.execute("""
-                        INSERT INTO rfid_audit
-                        (tid, epc, label_number, item, batch_no, muf_no, area,
-                         qty_old, qty_new, from_rack_location, to_rack_location,
-                         result, change_notes, printed, remark, device_id, verified_by, created_at)
-                        VALUES
-                        (%s,%s,%s,%s,%s,%s,%s,
-                         %s,%s,%s,%s,
-                         %s,%s,0,%s,%s,%s,NOW())
-                    """, (
-                        old["tid"], new["epc"], new["label_number"], new["item"], new["batch_no"], old["muf_no"], old["area"],
-                        old["qty"], final_qty, old["rack_location"], final_rack,
-                        result, change_notes, body.remark, body.device_id, body.actor
-                    ))
-                    audit_id = cur.lastrowid
-
                 conn.commit()
-                return (audit_id, result, change_notes, new)
+                return new
             except:
                 conn.rollback(); raise
             finally:
@@ -598,25 +543,79 @@ async def audit_verify_save(body: AuditReq) -> AuditResp:
         finally:
             conn.close()
 
-    audit_id, result, change_notes, latest = await asyncio.wait_for(asyncio.to_thread(_work), timeout=int(os.getenv("WRITE_TIMEOUT", "5")))
-    return AuditResp(audit_id=audit_id, result=result, change_notes=change_notes, latest=latest)
+    row = await asyncio.wait_for(asyncio.to_thread(_work), timeout=int(os.getenv("WRITE_TIMEOUT", "4")))
+    return row
 
-class MarkPrintedReq(BaseModel):
-    audit_id: int
 
-@app.post("/audit/mark-printed", dependencies=[Depends(require_key)])
-async def audit_mark_printed(body: MarkPrintedReq):
+
+# ---------- DEREGISTER ----------
+@app.post("/tags/{tid}/deregister", dependencies=[Depends(require_key)])
+async def deregister_by_tid(tid: str, body: DeregReq):
     pool = get_pool()
     def _work():
         conn = pool.get_connection()
         try:
             conn.ping(reconnect=True, attempts=1, delay=0)
-            cur = conn.cursor()
+            conn.start_transaction()
+            cur = conn.cursor(dictionary=True)
             try:
-                cur.execute("UPDATE rfid_audit SET printed=1, printed_at=NOW() WHERE id=%s", (body.audit_id,))
-                return {"ok": True}
+                # 1) 锁当前行
+                cur.execute("""
+                    SELECT tid, epc, label_number, muf_no, item, qty, batch_no, rack_location, area
+                    FROM rfid_tags_current WHERE UPPER(tid)=UPPER(%s) FOR UPDATE
+                """, (tid,))
+                old = cur.fetchone()
+                if not old:
+                    raise HTTPException(404, "not found")
+
+                # 2) 清空关键绑定字段（area/epc/label 不动）
+                cur.execute("""
+                    UPDATE rfid_tags_current
+                    SET muf_no=NULL,
+                        batch_no=NULL,
+                        rack_location=NULL,
+                        remark=NULL,
+                        item='-',
+                        qty=0,
+                        audit_at=NULL,
+                        updated_at=NOW(),
+                        updated_by=%s
+                    WHERE UPPER(tid)=UPPER(%s)
+                """, (body.actor, tid))
+
+                # 3) 读新值
+                cur.execute("""
+                    SELECT tid, epc, label_number, muf_no, item, qty, batch_no, rack_location, area,
+                           remark, updated_at, updated_by, audit_at
+                    FROM rfid_tags_current WHERE UPPER(tid)=UPPER(%s)
+                """, (tid,))
+                new = _normalize_row(cur.fetchone())
+
+                # 4) 写日志（action=REUSE，qty_old -> 旧值，qty_new -> 0；库位从 old 到 NULL；area 保持不变）
+                cur.execute("""
+                    INSERT INTO rfid_tags_log
+                    (tid, epc, label_number, item, batch_no, action,
+                     qty_old, qty_new, from_rack_location, to_rack_location,
+                     area_old, area_new, remark, updated_at, updated_by)
+                    VALUES
+                    (%s,%s,%s,%s,%s,'REUSE',
+                     %s,%s,%s,NULL,
+                     %s,%s,%s,NOW(),%s)
+                """, (
+                    old["tid"], new["epc"], new["label_number"], new["item"], new["batch_no"],
+                    old["qty"], new["qty"], old["rack_location"],
+                    old["area"], new["area"],
+                    body.remark, body.actor
+                ))
+
+                conn.commit()
+                return new
+            except:
+                conn.rollback(); raise
             finally:
                 cur.close()
         finally:
             conn.close()
-    return await asyncio.wait_for(asyncio.to_thread(_work), timeout=3)
+
+    row = await asyncio.wait_for(asyncio.to_thread(_work), timeout=int(os.getenv("WRITE_TIMEOUT", "4")))
+    return row
