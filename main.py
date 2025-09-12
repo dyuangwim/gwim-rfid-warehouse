@@ -7,7 +7,6 @@ import mysql.connector
 from mysql.connector import pooling
 from mysql.connector import errors as sqlerr
 from datetime import datetime, date
-from pydantic import BaseModel
 
 load_dotenv()
 
@@ -65,8 +64,7 @@ class UpdateReq(BaseModel):
     remark: str | None = None
     actor: str = "userA"
     device_id: str = "T1U-1"
-    # 乐观并发：客户端视图的旧时间戳
-    prev_updated_at: str | None = None
+    prev_updated_at: str | None = None  # 乐观并发
 
 class RegisterReq(BaseModel):
     tid: str
@@ -77,7 +75,7 @@ class RegisterReq(BaseModel):
     qty: int
     batch_no: str | None = None
     rack_location: str | None = None
-    area: str = "W/H"
+    area: str | None = None
     remark: str | None = None
     actor: str = "userA"
     device_id: str = "T1U-1"
@@ -86,22 +84,6 @@ class DeregReq(BaseModel):
     actor: str = "userA"
     device_id: str = "T1U-1"
     remark: str | None = None
-
-# NEW: Audit req/resp
-# class AuditReq(BaseModel):
-#     tid: str | None = None
-#     epc: str | None = None
-#     qty: int | None = None
-#     rack_location: str | None = None   # None=不改, ""=清空, 其他=更新
-#     remark: str | None = None
-#     actor: str = "auditor"
-#     device_id: str = "T1U-1"
-
-# class AuditResp(BaseModel):
-#     audit_id: int
-#     result: str               # "NO_CHANGES" / "CHANGED"
-#     change_notes: str | None
-#     latest: TagRow | None
 
 # 需要库位的区域（与前端一致）
 REQUIRED_RACK_AREAS = {"W/H", "KITING"}
@@ -194,6 +176,8 @@ async def update_by_tid(tid: str, body: UpdateReq):
     rack_up  = (rack_raw.strip().upper() if isinstance(rack_raw, str) and rack_raw.strip() != "" else None)
     batch_up = _upper_or_none(body.batch_no)
     item_up  = _upper_or_none(body.item)
+    # 原始/归一化 area
+    area_raw = body.area if isinstance(body.area, str) else None
     area_up  = _upper_or_none(body.area)
     label_up = _upper_or_none(body.label_number)
     muf_up   = _upper_or_none(body.muf_no)
@@ -224,8 +208,14 @@ async def update_by_tid(tid: str, body: UpdateReq):
                     if str(old_ts) != str(body.prev_updated_at):
                         raise HTTPException(409, "conflict: the tag was updated by someone else")
 
-                # 最终值 & 校验
-                final_area = (area_up or old["area"])
+                # === 最终值 & 校验 ===
+                # area: "" → NULL；None → 不改；否则更新为大写
+                if area_raw == "":
+                    final_area = None
+                else:
+                    final_area = area_up if area_up is not None else old["area"]
+
+                # rack: "" → NULL；None → 不改；否则更新为大写
                 if rack_raw is None:
                     final_rack = old["rack_location"]
                 else:
@@ -243,7 +233,7 @@ async def update_by_tid(tid: str, body: UpdateReq):
                     if cur.fetchone():
                         raise HTTPException(409, "EPC already used by another tag")
 
-                # UPDATE
+                # UPDATE（仍按原有 CASE 写入）
                 cur.execute("""
                     UPDATE rfid_tags_current
                     SET epc=COALESCE(%s, epc),
@@ -257,14 +247,19 @@ async def update_by_tid(tid: str, body: UpdateReq):
                             WHEN %s = '' THEN NULL
                             ELSE %s
                         END,
-                        area=COALESCE(%s, area),
+                        area = CASE
+                            WHEN %s IS NULL THEN area
+                            WHEN %s = ''   THEN NULL
+                            ELSE %s
+                        END,
                         remark=COALESCE(%s, remark),
                         updated_at=NOW(), updated_by=%s
                     WHERE UPPER(tid)=UPPER(%s)
                 """, (
                     epc_up, label_up, muf_up, item_up, body.qty, batch_up,
                     rack_raw, rack_raw, rack_up,
-                    area_up, remark_v, body.actor, tid
+                    area_raw, area_raw, area_up,
+                    remark_v, body.actor, tid
                 ))
 
                 # 取新值
@@ -273,17 +268,17 @@ async def update_by_tid(tid: str, body: UpdateReq):
                            remark, updated_at, updated_by, audit_at
                     FROM rfid_tags_current WHERE UPPER(tid)=UPPER(%s)
                 """, (tid,))
-                new = cur.fetchone()
-                new = _normalize_row(new)
+                new = _normalize_row(cur.fetchone())
 
-                # 动作归类 & 日志
-                qty_changed   = (body.qty is not None and body.qty != old["qty"])
-                area_changed  = (area_up is not None and new["area"] != old["area"])
-                rack_changed  = (new["area"] in REQUIRED_RACK_AREAS and new["rack_location"] != old["rack_location"])
+                # === 动作归类（用最终值对比，修正“清空”时误判） ===
+                qty_changed  = (body.qty is not None and body.qty != old["qty"])
+                area_changed = ((final_area or "") != (old["area"] or ""))
+                rack_changed = (final_area in REQUIRED_RACK_AREAS) and ((final_rack or "") != (old["rack_location"] or ""))
                 final_action = body.action
                 if not qty_changed and (area_changed or rack_changed) and body.action != "ADJUST_QTY":
                     final_action = "MOVE"
 
+                # 日志
                 cur.execute("""
                     INSERT INTO rfid_tags_log
                     (tid, epc, label_number, item, batch_no, action,
@@ -327,8 +322,9 @@ async def register(body: RegisterReq):
     rack_up   = _upper_or_none(body.rack_location)
     muf_up    = _upper_or_none(body.muf_no)
     remark_v  = body.remark
-    area_up   = _upper_or_none(body.area) or "W/H"
+    area_up   = _upper_or_none(body.area)
 
+    # 仅当 area 不是 NULL 时，才要求库位
     if area_up in REQUIRED_RACK_AREAS and (rack_up is None or rack_up.strip() == ""):
         raise HTTPException(400, f"rack_location required for area {area_up}")
 
@@ -440,7 +436,7 @@ async def bom_all_items_lite():
             conn.close()
     return await asyncio.wait_for(asyncio.to_thread(_work), timeout=int(os.getenv("READ_TIMEOUT", "3")))
 
-# ---------- 下行增量接口（稳定分页：updated_at + tid） ----------
+# ---------- 下行增量接口 ----------
 @app.get("/tags/updated-since", dependencies=[Depends(require_key)])
 async def tags_updated_since(
     ts: str = Query("1970-01-01 00:00:00"),
@@ -471,9 +467,6 @@ async def tags_updated_since(
             conn.close()
     rows = await asyncio.wait_for(asyncio.to_thread(_work), timeout=int(os.getenv("READ_TIMEOUT", "4")))
     return rows
-
-
-
 
 # ---------- AUDIT REMARK ----------
 class AuditMarkReq(BaseModel):
@@ -529,8 +522,8 @@ async def mark_audit_by_tid(tid: str, body: AuditMarkReq):
                      %s,%s,%s,NOW(),%s)
                 """, (
                     old["tid"], new["epc"], new["label_number"], new["item"], new["batch_no"],
-                    old["qty"], old["qty"],     # 审计不改数量 → old=old
-                    old["area"], old["area"],   # 审计不改区域
+                    old["qty"], old["qty"],
+                    old["area"], old["area"],
                     body.remark, body.actor
                 ))
 
@@ -545,8 +538,6 @@ async def mark_audit_by_tid(tid: str, body: AuditMarkReq):
 
     row = await asyncio.wait_for(asyncio.to_thread(_work), timeout=int(os.getenv("WRITE_TIMEOUT", "4")))
     return row
-
-
 
 # ---------- DEREGISTER ----------
 @app.post("/tags/{tid}/deregister", dependencies=[Depends(require_key)])
@@ -568,7 +559,7 @@ async def deregister_by_tid(tid: str, body: DeregReq):
                 if not old:
                     raise HTTPException(404, "not found")
 
-                # 2) 清空关键绑定字段（area/epc/label 不动）
+                # 2) 清空关键绑定字段（area/epc/label 不动；area 同步置 NULL）
                 cur.execute("""
                     UPDATE rfid_tags_current
                     SET muf_no=NULL,
@@ -577,6 +568,7 @@ async def deregister_by_tid(tid: str, body: DeregReq):
                         remark=NULL,
                         item='-',
                         qty=0,
+                        area=NULL,
                         audit_at=NULL,
                         updated_at=NOW(),
                         updated_by=%s
@@ -591,7 +583,7 @@ async def deregister_by_tid(tid: str, body: DeregReq):
                 """, (tid,))
                 new = _normalize_row(cur.fetchone())
 
-                # 4) 写日志（action=REUSE，qty_old -> 旧值，qty_new -> 0；库位从 old 到 NULL；area 保持不变）
+                # 4) 写日志（area_old → area_new=NULL）
                 cur.execute("""
                     INSERT INTO rfid_tags_log
                     (tid, epc, label_number, item, batch_no, action,
